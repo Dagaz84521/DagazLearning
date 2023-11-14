@@ -417,3 +417,184 @@ void checkInvoke(struct thread *t, void* aux UNUSED){
 1. 首先是最关键的问题，这个实验自己写的成分有多少。说实话，一开始没什么思路，什么时候有思路的呢？看着老师发群里的PPT后面几页，看完豁然开朗，直接就有动力开写了。所以说思路确实不完全是我自己想的，但内部的代码实现，都是我自己一步一步试过来的。
 2. 关于Block_list实现的可能性，有，而且很大，但不好实现，因为需要改的东西有点多，至少需要多改两个函数thread_block(需要把线程从ready_list中删掉，并把线程加入到block_list)和thread_unblock(需要把线程从block_list中删去，加入到ready_block里)，别的应该和对all_list进行操作没有区别。通过维护一个block_list，并不是一定是效率的提升，我觉得这个里面还是有trade-off的，因为需要不断地对两个链表进行增加和删减的操作，但可以少判断一些不在block的线程。
 3. 关于那个timer_sleep中interrupt status改变，我是通过程序的报错来发现的。但是，现在我有一个新的解释，因为我发现这个进入前intr_disable，退出后intr_enable，很像防止临界区冲突的一个解决方案。我要将这个线程block，此时就不应该发生中断。等我将这个线程block完成后，释放了这个锁，就可以发生中断。
+
+### 二、实现优先级调度
+
+#### 1.要求：
+
+- 能够完成CPU优先级调度算法，实现alarm-priority以降序输出。
+- 
+
+#### 2.实验思路
+
+##### ①怎么实现优先级调度？
+
+​	从上一个Task我们可以知道，整个系统的线程依靠两个双链表来维护。在未修改时，所有线程都会插入到链表的尾部。而每次执行的都是链表头的那个线程。所以我们只需要将这个链表维护好，使其成为一个有序的链表，排序的标准就是按照优先级向下排序。
+
+##### ②哪些行为会对链表进行操作？
+
+​	首先是一个线程刚被创建时init_thread()函数会将线程插入all_list，其次在thread_yield()中，会将线程放进ready_list，最后当线程解除block时，也就是unblock时，会将线程放入ready_list里
+
+#### 3.实验过程：
+
+##### ①初次尝试
+
+​	init_thread、thread_yield和thread_unblock中，最后都用了一个list_push_back将线程插入到相应的队列的尾部。而要使链表有序，就不应该这么做，我们需要让其插入到有序的位置。所以，要么就对整个队列进行排序，要么每次插入的时候，都使要插入的线程的优先级比前面的小，比后面的大。这里我采用后面这种方法，首先实现起来方便，其次效率也更高。
+
+​	刚好，在list.h这个文件里，给了我们一个函数list_insert_ordered():
+
+```c
+void
+list_insert_ordered (struct list *list, struct list_elem *elem,
+                     list_less_func *less, void *aux)
+{
+  struct list_elem *e;
+
+  ASSERT (list != NULL);
+  ASSERT (elem != NULL);
+  ASSERT (less != NULL);
+
+  for (e = list_begin (list); e != list_end (list); e = list_next (e))
+    if (less (elem, e, aux))
+      break;
+  return list_insert (e, elem);
+}
+```
+
+这个函数根据less这个函数来确定需要插入的位置，而这个less需要我们自己编写。
+
+所以就先从这个函数开始入手：
+
+```c
+bool thread_cmp(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
+{
+  int offset = *(int*)aux;
+  int *valueOfa = (int*)((char*)a + offset);
+  int *valueOfb = (int*)((char*)b + offset);
+  return *valueOfa > *valueOfb;
+}
+```
+
+这里通过aux来传递一个offset，是thread结构体中priority成员到thread头部的距离，可以通过这个来获得priority的地址，然后再进行比较。
+
+这个函数写完了，我们再需要将list_push_back替换成list_insert_ordered。
+
+```c
+//init_thread:
+ list_insert_ordered (&all_list, &t->allelem, (list_less_func *) &thread_cmp, offsetof(struct thread,priority));
+//thread_yield:
+list_insert_ordered (&ready_list, &t->elem, (list_less_func *) &thread_cmp, offsetof(struct thread,priority));
+//thread_unblock:
+list_insert_ordered (&ready_list, &t->elem, (list_less_func *) &thread_cmp, offsetof(struct thread,priority));
+```
+
+然后润一下
+
+![image-20231113201816516](图片/image-20231113201816516.png)
+
+果然出问题了，直接就报错了。思路上来说，应该没问题，但应该哪里搞错了。
+
+经过长久的查错，我终于发现哪里有问题了，这个问题出在init_thread里：
+
+```c
+static void
+init_thread (struct thread *t, const char *name, int priority)
+{
+  enum intr_level old_level;
+
+  ASSERT (t != NULL);
+  ASSERT (PRI_MIN <= priority && priority <= PRI_MAX);
+  ASSERT (name != NULL);
+
+  memset (t, 0, sizeof *t);
+  t->status = THREAD_BLOCKED;
+  strlcpy (t->name, name, sizeof t->name);
+  t->stack = (uint8_t *) t + PGSIZE;
+  t->priority = priority;
+  t->magic = THREAD_MAGIC;
+
+  old_level = intr_disable ();
+  list_insert_ordered (&all_list, &t->allelem, (list_less_func *) &thread_cmp_priority, offsetof(struct thread,priority));
+  intr_set_level (old_level);
+}
+```
+
+这个错误太低级了，但是太难发现了。这里我加进去的list_insert_ordered中priority，按我的想法，应该是thread中identifier为priority的成员，但是这个函数里的signature已经有一个同名的priority，所以这里的priority会自动认定为一个int变量。所以要避免这个事情发生，我的想法是将这个offset拿出来，成为一个全局变量。
+
+```c
+int thread_priority_ofs = offsetof(struct thread, priority);
+
+//init_thread:
+ list_insert_ordered (&all_list, &t->allelem, (list_less_func *) &thread_cmp, &thread_priority_ofs);
+//thread_yield:
+list_insert_ordered (&ready_list, &t->elem, (list_less_func *) &thread_cmp, &thread_priority_ofs);
+//thread_unblock:
+list_insert_ordered (&ready_list, &t->elem, (list_less_func *) &thread_cmp, &thread_priority_ofs);
+```
+
+这下应该没什么问题了吧。
+
+![image-20231113154038687](图片/image-20231113154038687.png)
+
+呃，呃呃了。还是不行。为什么呢？
+
+我准备开始跟踪着看看，我在比较函数里，把两个线程的priority和offset都输出一下，看看有没有问题。
+
+![image-20231113203120335](图片/image-20231113203120335.png)
+
+啊？两个线程的priority都是0？
+
+最新进展：我重新看了一遍thread结构体的定义和list_elem结构体的定义，以及插入列表的函数。我发现了我一直以来的一个误区，那就是我一直以为链表的每个节点都是thread结构体，我在比较函数里面拿到的就是thread的首地址，这样我就可以通过一个offset就能拿到priority的地址和priority的值。但是事情并不是这样的，挂在链表上的其实是list_elem，而这个每个list_elem又是各自的thread的成员，就好像晾衣服，list_elem上挂着衣服然后再挂到list这个晾衣绳上，显然，衣架并不是衣服。所以接下来的任务，是从list_elem去找到thread，然后再进一步去找priority。
+
+但是其实，直接根据elem和priority的相对位置就能直接找到priority。
+
+```c
+int priority_elem_ofs = offsetof(struct thread, priority) - offsetof(struct thread, elem);
+int priority_allelem_ofs = offsetof(struct thread, priority) - offsetof(struct thread, allelem);
+```
+
+就是这两个全局变量了。因为一个thread是有可能会挂在两个list上的，一个由allelem构成的all_list和一个由elem构成的ready_list，所以需要有两个。
+
+然后就是比较函数，其实差不多。
+
+```c
+bool thread_cmp (const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
+{
+
+  int offset = *(int*)aux;
+  int *valueOfa = (int*)((char*)a + offset);
+  int *valueOfb = (int*)((char*)b + offset);
+  return *valueOfa > *valueOfb;
+}
+```
+
+然后需要稍微修改一下输入的参数。
+
+```c
+//init_thread:
+ list_insert_ordered (&all_list, &t->allelem, (list_less_func *) &thread_cmp, &priority_allelem_ofs);
+//thread_yield:
+list_insert_ordered (&ready_list, &t->elem, (list_less_func *) &thread_cmp, &priority_elem_ofs);
+//thread_unblock:
+list_insert_ordered (&ready_list, &t->elem, (list_less_func *) &thread_cmp, &priority_elem_ofs);
+```
+
+![image-20231113225640608](图片/image-20231113225640608.png)
+
+同小组王力同学采用了使用宏list_entry的方法，看了一下，感觉我自己好多功夫其实都是无用功。怎么说呢？有人就是享受这种折磨自己的感觉吧。不过我好像看出他的比较函数好像有些问题，因为他只写了一个针对elem（对应了ready_list队列）的排序，即使是传进来的是allelem，也是使用这个函数，这样难道不会导致all_list出问题吗？但他却也能正常运行。好奇怪啊。而且看list_insert_ordered上面注释也讲了，需要根据aux来辅助比较，他的比较函数里aux是UNUSED的。不过我也还没有问他，有可能他也同样写了一个allelem的函数，只是我没看到。哎，什么时候讨论一下吧。
+
+
+
+这样，第一小步终于结束了。该想办法怎么通过优先级捐赠（个人比较喜欢优先级继承这个名字）来解决优先级反转的问题了。
+
+
+
+#### 4.实验结果
+
+##### ①代码
+
+##### ②实验结果：
+
+##### ③小结和反思：
+
+- 首先是对第一步实现优先级调度，只能说，感觉一半时间在和整个那个list做斗争，一半时间在和指针在做斗争。只能说C语言指针没学好暴露了。虽然没写出来比较函数里面各种的格式转化，比如如何把list_elem结构体的指针转化成一个可以比较的int类型的priority。可能在实验报告里面看起来很轻松，但是其实都是在网上查了许多博客之后才写出来的。
