@@ -58,7 +58,8 @@ static unsigned thread_ticks;   /* # of timer ticks since last yield. */
    If true, use multi-level feedback queue scheduler.
    Controlled by kernel command-line option "-o mlfqs". */
 bool thread_mlfqs;
-
+int priority_elem_ofs = offsetof(struct thread, priority) - offsetof(struct thread, elem);
+int priority_allelem_ofs = offsetof(struct thread, priority) - offsetof(struct thread, allelem);
 static void kernel_thread (thread_func *, void *aux);
 
 static void idle (void *aux UNUSED);
@@ -238,7 +239,7 @@ thread_unblock (struct thread *t)
 
   old_level = intr_disable ();
   ASSERT (t->status == THREAD_BLOCKED);
-  list_push_back (&ready_list, &t->elem);
+  list_insert_ordered (&ready_list, &t->elem, (list_less_func *) &thread_cmp_priority, &priority_elem_ofs);
   t->status = THREAD_READY;
   intr_set_level (old_level);
 }
@@ -309,7 +310,7 @@ thread_yield (void)
 
   old_level = intr_disable ();
   if (cur != idle_thread) 
-    list_push_back (&ready_list, &cur->elem);
+    list_insert_ordered (&ready_list, &cur->elem, (list_less_func *) &thread_cmp_priority, &priority_elem_ofs);
   cur->status = THREAD_READY;
   schedule ();
   intr_set_level (old_level);
@@ -466,7 +467,7 @@ init_thread (struct thread *t, const char *name, int priority)
   t->magic = THREAD_MAGIC;
 
   old_level = intr_disable ();
-  list_push_back (&all_list, &t->allelem);
+  list_insert_ordered (&all_list, &t->allelem, (list_less_func *) &thread_cmp_priority, &priority_allelem_ofs);
   intr_set_level (old_level);
 }
 
@@ -591,4 +592,14 @@ void checkInvoke(struct thread *t, void* aux UNUSED){
       thread_unblock(t);
   }
     
+}
+
+/* priority compare function. */
+bool thread_cmp_priority (const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
+{
+
+  int offset = *(int*)aux;
+  int *valueOfa = (int*)((char*)a + offset);
+  int *valueOfb = (int*)((char*)b + offset);
+  return *valueOfa > *valueOfb;
 }
