@@ -583,7 +583,18 @@ list_insert_ordered (&ready_list, &t->elem, (list_less_func *) &thread_cmp, &pri
 
 同小组王力同学采用了使用宏list_entry的方法，看了一下，感觉我自己好多功夫其实都是无用功。怎么说呢？有人就是享受这种折磨自己的感觉吧。不过我好像看出他的比较函数好像有些问题，因为他只写了一个针对elem（对应了ready_list队列）的排序，即使是传进来的是allelem，也是使用这个函数，这样难道不会导致all_list出问题吗？但他却也能正常运行。好奇怪啊。而且看list_insert_ordered上面注释也讲了，需要根据aux来辅助比较，他的比较函数里aux是UNUSED的。不过我也还没有问他，有可能他也同样写了一个allelem的函数，只是我没看到。哎，什么时候讨论一下吧。
 
+接下来，还有一个问题，就是现在的优先级调度并不支持抢占。
 
+前面的都完成了，这个解决起来就比较简单了。只需要解决一个问题：什么时候会发生抢占呢？
+
+无非就是两种情况：
+
+1. 一个进程新建的时候。
+2. 进程的优先级被修改的时候。
+
+所以只需要对这两个地方对应的`thread_create()`和`thread_set_priority()`进行修改就行了。只需要在执行结束时，主动放弃CPU，待调度程序重新挑选CPU进行执行就可以了。
+
+也即是在这两个函数最后加上一句`thread_yield`就可以轻松解决了。
 
 这样，第一小步终于结束了。该想办法怎么通过优先级捐赠（个人比较喜欢优先级继承这个名字）来解决优先级反转的问题了。
 
@@ -598,3 +609,1111 @@ list_insert_ordered (&ready_list, &t->elem, (list_less_func *) &thread_cmp, &pri
 ##### ③小结和反思：
 
 - 首先是对第一步实现优先级调度，只能说，感觉一半时间在和整个那个list做斗争，一半时间在和指针在做斗争。只能说C语言指针没学好暴露了。虽然没写出来比较函数里面各种的格式转化，比如如何把list_elem结构体的指针转化成一个可以比较的int类型的priority。可能在实验报告里面看起来很轻松，但是其实都是在网上查了许多博客之后才写出来的。
+
+### 三、解决优先级反转的问题
+
+#### 1.要求：
+
+1. 解决优先级反转。
+
+#### 2.实验思路：
+
+##### ①什么是优先级反转？
+
+优先级反转就是当一个低优先级进程持有互斥锁，而高优先级进程也在请求这一互斥锁，所以高优先级被阻塞。此时而低优先级进程竞争不过其他的中优先级进程，所以出现中优先级进程优先执行，高优先级进程被阻塞的情况。
+
+##### ②如何解决优先级反转？
+
+基本思路就是提高低优先级进程的优先级，让占有锁的低优先级进程先执行。完成后会释放锁供高优先级进程使用。最简单的方法就是将低优先级进程的优先级提至最高。但这样就会导致中优先级和低优先级发生互斥的时候，高优先级会被阻塞。所以Pintos采用了一种更合理的方法——优先级捐赠。将高优先级的优先级捐给低优先级进程，使其优先级高于中优先级进程，同时又避免了低优先级进程抢占更高优先级进程。
+
+##### ③在什么时候进行优先级捐赠？
+
+按照优先级反转的定义，我们可以知道这一问题发生在互斥访问的时候。当某个进程申请锁的时候，如果这个锁的拥有进程的优先级低于申请的进程，就会进行优先级捐赠。
+
+##### ④可能会出现的特殊情况：
+
+1. 有可能出现一个锁1被某个进程1持有，但这个进程完成执行又需要另一个锁2，而锁2被进程2持有的，以此类推进而形成一条链的情况。
+2. 有可能出现一个进程持有多个锁，所以可能会有多个进程对其进行捐赠。
+
+对于情况1，我们需要不断地向这条链上的进程进行优先级捐赠，直到尾部的进程执行完，释放了锁，然后从后往前逐步释放锁。
+
+对于情况2，对于多对一捐赠，我们需要取优先级最高的进程所捐赠的优先级。
+
+##### ⑤释放锁后应该怎么做？
+
+如果只有一个进程捐赠，释放锁后，应该回到原来的优先级。(如果不变回的话，优先级就发生了改变，低优先级进程就成了高优先级进程了)
+
+如果有多个进程捐赠，释放锁后，应该将优先级变成剩下的进程中最高的那个。
+
+这也就说明，我们可能需要一个结构来存储某个线程被多少个进程捐赠了优先级，因为无法确定究竟需要多少大小，所以一个链表显然优于一个数组。同时还需要一个成员变量来记录这个进程原来的优先级，以便恢复优先级。
+
+#### 3.实验过程
+
+##### ①对结构体进行修改
+
+主要增加了一个int类型成员变量`origin_priority`用于记录未被捐赠时进程的优先级。此外，我们还需要一个链表，用于存储捐赠的优先级。现在有两个思路，一个是存储捐赠了优先级的进程，另一个是存储当前线程持有的锁。那么那种方案比较合适呢？进程的话，优先级比较直观，当一个锁释放的时候，需要将所有申请这个锁的进程从链表上移出；但若是锁，就是这个锁释放时候，将锁移出就行了。但无论是哪种方法，在释放锁后应该在剩下的选择一个最大的优先级作为此后的优先级。
+
+经过我的思考后，我选择采用lock的链表，而不是thread的链表，理由如下：
+
+1. 是哪个thread捐赠的并不重要，重要的是捐赠的优先级，所以完全可以在锁里增加一个最大的优先级，来记录到目前为止捐赠的最大优先级，以此就可以完全不用管其他线程。
+2. 此外，如果用thread，需要对结构体进行的修改，除了`origin_priority`以外，我们还需要一个链表之外还需要一个lock的指针来指向其申请的锁。而lock的话，只需要一个链表就可以了。最大的优先级可以由锁自己来保管。
+
+除了这个，我们还需要一个lock_waiting，来记录当前线程正在请求哪个锁，方便实现优先级的传递。
+
+首先需要对thread结构体进行修改
+
+```c
+struct thread
+  {
+    /* Owned by thread.c. */
+    tid_t tid;                          /* Thread identifier. */
+    enum thread_status status;          /* Thread state. */
+    char name[16];                      /* Name (for debugging purposes). */
+    uint8_t *stack;                     /* Saved stack pointer. */
+    int origin_priority;				/* Original priority */
+    int priority;                       /* Priority. */
+    struct list holding_locks;			/* Locks held by this thread */
+    struct lock* lock_waiting;			/* Waiting for the lock */
+    struct list_elem allelem;           /* List element for all threads list. */
+    /* Shared between thread.c and synch.c. */
+    struct list_elem elem;              /* List element. */
+    int64_t ticks_blocked;              /* Remain sleep ticks*/
+#ifdef USERPROG
+    /* Owned by userprog/process.c. */
+    uint32_t *pagedir;                  /* Page directory. */
+#endif
+
+    /* Owned by thread.c. */
+    unsigned magic;                     /* Detects stack overflow. */
+  };
+```
+
+然后就是lock的结构体也需要修改
+
+```c
+struct lock 
+  {
+    int max_priority;
+    struct list_elem elem;
+    struct thread *holder;      /* Thread holding lock (for debugging). */
+    struct semaphore semaphore; /* Binary semaphore controlling access. */
+  };
+```
+
+主要就是一个`max_priority`来保管捐赠的最高优先级。如果是未被任何进程持有的锁，应该保证`max_priority`为最低的优先级。以便被进程占有的时候，可以设置为当前进程的优先级，方便其他进程进行优先级比较。
+
+还有一个list_elem类型的elem，用于将lock连接到holding_locks的链表上。
+
+既然结构体发生了变化，其初始化函数一定就要做出相应的更改。
+
+```c
+static void
+init_thread (struct thread *t, const char *name, int priority)
+{
+  enum intr_level old_level;
+
+  ASSERT (t != NULL);
+  ASSERT (PRI_MIN <= priority && priority <= PRI_MAX);
+  ASSERT (name != NULL);
+
+  memset (t, 0, sizeof *t);
+  t->status = THREAD_BLOCKED;
+  strlcpy (t->name, name, sizeof t->name);
+  t->stack = (uint8_t *) t + PGSIZE;
+  t->priority = priority;
+  t->magic = THREAD_MAGIC;
+  t->origin_priority = priority;
+  list_init(&t->holding_locks);
+  old_level = intr_disable ();
+  list_insert_ordered (&all_list, &t->allelem, (list_less_func *) &thread_cmp_priority, &priority_allelem_ofs);
+  intr_set_level (old_level);
+}
+```
+
+```c
+void
+lock_init (struct lock *lock)
+{
+  ASSERT (lock != NULL);
+  lock->
+  lock->holder = NULL;
+  sema_init (&lock->semaphore, 1);
+}
+```
+
+##### ②申请锁
+
+我准备按照事情发生的顺序来写，所以要是整件事开始发生，第一件事情就是有进程申请锁，即调用了`lock_acquire`。
+
+```c
+void
+lock_acquire (struct lock *lock)
+{
+  ASSERT (lock != NULL);
+  ASSERT (!intr_context ());
+  ASSERT (!lock_held_by_current_thread (lock));
+//前
+  sema_down (&lock->semaphore);
+//后
+  lock->holder = thread_current ();
+}
+```
+
+首先，如果这个锁是空闲的，进程就不会在sema_down这一句内被阻塞，而是会出去执行lock->holder；所以我们需要在`sema_down`这一句之后做两件事：
+
+1. 把该锁连接到holding_locks上
+2. 修改这个锁的优先级。
+
+如果这个锁是被占有的，进程就会在sema_down这一句被阻塞。阻塞的时候，就需要进行判断是否进行优先级捐赠了，若当前进程的优先级大于锁的最大优先级，就把锁的最大优先级进行修改。
+
+所以我在想，既然两种情况都需要对锁的优先级进行修改，那么不妨就在`sema_down`前，就把锁的优先级修改了。
+
+```c
+void
+lock_acquire (struct lock *lock)
+{
+  struct thread* current_thread = thread_current();
+  struct thread* holder = lock->holder;
+  int priority = thread_current()->priority;
+
+  ASSERT (lock != NULL);
+  ASSERT (!intr_context ());
+  ASSERT (!lock_held_by_current_thread (lock));
+  
+  do{
+    if(priority > lock->max_priority){
+      lock->max_priority = priority;
+    }else{
+      priority = lock->max_priority;
+    }
+    holder = lock->holder;
+  }while(holder != NULL);
+
+  sema_down (&lock->semaphore);
+    
+  list_insert_ordered(&current_thread->holding_locks,&lock->elem, lock_cmp_priority, max_priority);
+    
+  lock->holder = thread_current ();
+}
+```
+
+这个就是第一版的做法，但是存在很大问题，主要实现的是一个思路上，很明显是跑不起来的。在前后，我准备将其写成两个函数来封装。首先，在`sema_down`之前，进行优先级捐赠。在`sema_down`之后，把锁连到占有链表上。前一个do循环，可以采用递归的方式，将优先级捐赠，同时满足如果是申请空闲的锁，就直接把自身的priority给锁。后一个insert也把其封装成一个函数，保证其原子操作。
+
+![24580000542bd24c0a0266abff2f228](图片/24580000542bd24c0a0266abff2f228.jpg)
+
+思考一个问题，只要实现了优先级捐赠，最下面这张图是不是不可能会存在？优先级为4的进程已经申请了锁后，无论这个锁是否被持有，都不会轮到优先级为3的进程进行锁的申请。从更深的角度来看，是否当前进程的优先级和锁的最大优先级进行比较是不需要的，因为对于单CPU系统来说，优先级调度一定会执行未被阻塞的优先级最高的进程，所以能请求锁的进程，其优先级一定大于或等于当前占有锁的进程。但是，我还是有点不确定，所以我准备按照最稳的方法来，还是比较一下优先级，保持锁的优先级为最高的优先级。
+
+```c
+void
+lock_acquire (struct lock *lock)
+{
+  struct thread* current_thread = thread_current();
+  struct thread* holder = lock->holder;
+  int priority = thread_current()->priority;
+
+  ASSERT (lock != NULL);
+  ASSERT (!intr_context ());
+  ASSERT (!lock_held_by_current_thread (lock));
+
+  thread_donate_priority(lock);
+
+  sema_down (&lock->semaphore);
+  
+  lock->holder = thread_current ();
+}
+```
+
+然后`thread_donate_priority`函数我采用了一个递归调用的函数，只要不是未被占有的锁，就将当前线程的waiting改为这个锁，并调用递归。
+
+关于递归，递归终点是某个进程不等待锁，就可以正常执行或者某个进程的优先级比前面的进程优先级还大，就无需捐赠了。其他时候将锁的优先级改成现在进程的优先级（因为此时条件是lock!=NULL&&thread_current()->priority <= lock->max_priority），然后更新锁的持有者的优先级，如果其在就绪队列中，因为优先级的改变，所以就需要重新对ready_list进行排序，保证调度程序的正确执行。
+
+```c
+void thread_donate_priority(struct lock* lock){
+  enum intr_level old_level = intr_disable ();
+  if(lock->holder != NULL){
+    thread_current()->waiting = lock;
+    thread_donate_priority_recursion(lock);
+  }
+   intr_set_level (old_level);
+}
+
+void thread_donate_priority_recursion(struct lock* lock){
+  if(lock == NULL || thread_current()->priority <= lock->max_priority){
+    return;
+  }else{
+    lock->max_priority = thread_current()->priority;
+    thread_update_priority (lock->holder);
+      if (lock->holder->status == THREAD_READY){ 
+        list_remove (&lock->holder->elem);
+        list_insert_ordered (&ready_list, &lock->holder->elem, thread_cmp_priority, &priority_elem_ofs);
+      }
+    thread_donate_priority_recursion(lock->holder->waiting);
+  }
+}
+```
+
+这里还新加了一个thread_update_priority函数，目的是从thread持有的锁中选出最大优先级的锁来更新其优先级。除了这里会用到，待会的释放锁也需要用到。
+
+大致思路是，如果当前没有持有锁，就恢复为原优先级。如果持有，就将链表中拥有最大优先级（这里就是链表的第一个元素）的锁的优先级和线程自身的原优先级进行比较，选择二者的最大值作为之后的优先级。
+
+```c
+void thread_update_priority (struct thread *thread){
+  enum intr_level old_level = intr_disable ();
+    
+  if(list_empty(&thread->holding_locks)){
+    thread->priority = thread->origin_priority;
+  }else{
+    list_sort(&thread->holding_locks,lock_cmp_priority,&lock_priority_elem);
+    thread->priority = MAX(thread->origin_priority,list_entry(list_front (&thread->holding_locks), struct lock, elem)->max_priority);
+  }
+
+  intr_set_level (old_level);
+}
+```
+
+然后这里有涉及到list_sort里面需要用的优先级比较了`lock_cmp_priority`。
+
+```c
+bool lock_cmp_priority (const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
+{
+  int offset = *(int*)aux;
+  int *valueOfa = (int*)((char*)a + offset);
+  int *valueOfb = (int*)((char*)b + offset);
+  return *valueOfa > *valueOfb;
+}
+int lock_priority_elem = offsetof(struct lock, max_priority) - offsetof(struct lock, elem);
+```
+
+应该和前面`thread_cmp_priority`是一样的，所以这里只需要改个头就行了。这里的aux就是采用类似的`lock_priority_elem`就可以了。
+
+好了，现在完成一半了，我们还需要实现成功拿到锁后续处理。
+
+首先，先把当前线程等待锁改成NULL，因为有可能是阻塞了，最后成功拿到锁的线程，也有可能是直接申请到的。但无论是哪种情况，改回去总是不亏的。然后将锁的最大优先级改成当前线程的优先级，以备下一次优先级捐赠。然后再修改当前线程的holding_locks，将这个锁连接到链表上。
+
+```c
+//后
+thread_current()->waiting = NULL;
+lock->max_priority = thread_current()->priority;
+list_insert_ordered (&thread_current ()->holding_locks, &lock->elem, lock_cmp_priority, lock_priority_elem);
+```
+
+这样仅对申请锁就实现的差不多了，好难，做了很久，但是还是没做完，而且还得等释放锁做完才能进行测试，感觉有很多还没做好的地方，但是现在又想不到是哪里有问题。就先继续做下去吧。
+
+##### ③释放锁
+
+释放锁，好像就不需要考虑太多的东西了，就只要做好两件事：一、修改holding_locks，维护链表；二、更新线程的优先级，这个我们已经用`thread_update_priority`函数来实现了，所以只需要修改holding_locks
+
+```c
+void thread_remove_lock(struct lock* lock){
+  enum intr_level old_level = intr_disable ();
+  list_remove (&lock->elem);
+  thread_update_priority (thread_current ());
+  intr_set_level (old_level);
+}
+```
+
+然后，好像这样就好了。
+
+接着我就开始make了一下，报了几个简单的语法错误，我就不赘述了。然后我试着运行了一下priority-donate-one这个测试用例，出现如下情况。
+
+![image-20231203110115098](图片/image-20231203110115098.png)
+
+
+
+
+
+##### ④解决问题
+
+我先是测试用了单个测试，发现捐赠的priority就有问题，似乎就没有捐赠成功。所以我准备先返回看一看优先级捐赠那一部分。
+
+![image-20231203110311277](图片/image-20231203110311277.png)
+
+然后我又在初始化那里加入了一个printf，输出初始化后的thread的优先级，但是
+
+![image-20231203112355377](图片/image-20231203112355377.png)
+
+出现了这种情况，再看了看priority-donate-one的代码
+
+```c
+void
+test_priority_donate_one (void)
+{
+  struct lock lock;
+
+  /* This test does not work with the MLFQS. */
+  ASSERT (!thread_mlfqs);
+
+  /* Make sure our priority is the default. */
+  ASSERT (thread_get_priority () == PRI_DEFAULT);
+
+  lock_init (&lock);
+  lock_acquire (&lock);
+  //printf("lock is held by %s\n",&lock.holder->name);
+  thread_create ("acquire1", PRI_DEFAULT + 1, acquire1_thread_func, &lock);
+  msg ("This thread should have priority %d.  Actual priority: %d.",
+       PRI_DEFAULT + 1, thread_get_priority ());
+  thread_create ("acquire2", PRI_DEFAULT + 2, acquire2_thread_func, &lock);
+  msg ("This thread should have priority %d.  Actual priority: %d.",
+       PRI_DEFAULT + 2, thread_get_priority ());
+  lock_release (&lock);
+  msg ("acquire2, acquire1 must already have finished, in that order.");
+  msg ("This should be the last line before finishing this test.");
+}
+```
+
+第一个ASSERT没有出错，说明在申请锁之前，优先级是没问题，是PRI_DEFAULT(31)，是在优先级捐赠上出了问题。
+
+然后我又在我的thread_donate_priority这个函数上加了一句print表示进入了这个函数，但在实际运行的过程中没有出现这个输出，所以我可以肯定一个原因是没有进入这个函数，也就是没有进行优先级捐赠。那么判断条件if(lock->holder != NULL && !thread_mlfqs)就很暧昧了，两个必须满足其中一个，我也是分开测试了一下，发现如果lock_acquire这个函数动用printf就会导致整个系统崩溃，thread_mlfqs这个会出现，而lock->holder就不会。说明在申请完成后，并没有把lock->holder进行修改。但是，我又在测试用例的lock_acquire后又加上了printf来打印锁的持有者，是能够正确显示的，说明持有锁没有问题。这就非常奇怪了。
+
+![image-20231203124439550](图片/image-20231203124439550.png)
+
+可以看到，锁确确实实被main这个thread持有了。但是就是没有显示。然后我又对priority-donate-one这个测试文件进行修改，发现这个acquire1这个线程根本就没有进入acquire1_thread_func这个函数。这是为什么？很快，我就想到了为什么，在这张图里我们可以看到，acquire1和acquire2确实是被创建出来了，但是acquire1和acquire2却没有被得到执行，实际上一直执行的是main这个线程。这说明了什么，我们的优先级调度还没实现抢占，我们需要在create和set后面，交出控制权，让系统重新选择优先级最高的线程。
+
+```c
+void
+thread_set_priority (int new_priority) 
+{
+  if(thread_mlfqs)
+    return;
+  enum intr_level old_level = intr_disable ();
+  struct thread *current_thread = thread_current ();
+  int old_priority = current_thread->priority;
+  current_thread->original_priority = new_priority;
+
+  if (list_empty (&current_thread->holding_locks) || new_priority > old_priority)
+  {
+    current_thread->priority = new_priority;
+    thread_yield ();
+  }
+   intr_set_level (old_level);
+}
+```
+
+```c
+tid_t
+thread_create (const char *name, int priority,
+               thread_func *function, void *aux) 
+{
+  struct thread *t;
+  struct kernel_thread_frame *kf;
+  struct switch_entry_frame *ef;
+  struct switch_threads_frame *sf;
+  tid_t tid;
+
+  ASSERT (function != NULL);
+
+  /* Allocate thread. */
+  t = palloc_get_page (PAL_ZERO);
+  if (t == NULL)
+    return TID_ERROR;
+
+  /* Initialize thread. */
+  init_thread (t, name, priority);
+  tid = t->tid = allocate_tid ();
+
+  /* Stack frame for kernel_thread(). */
+  kf = alloc_frame (t, sizeof *kf);
+  kf->eip = NULL;
+  kf->function = function;
+  kf->aux = aux;
+
+  /* Stack frame for switch_entry(). */
+  ef = alloc_frame (t, sizeof *ef);
+  ef->eip = (void (*) (void)) kernel_thread;
+
+  /* Stack frame for switch_threads(). */
+  sf = alloc_frame (t, sizeof *sf);
+  sf->eip = switch_entry;
+  sf->ebp = 0;
+
+  t->ticks_blocked = 0;
+  /* Add to run queue. */
+  thread_unblock (t);
+  if (thread_current ()->priority < priority)
+   {
+     thread_yield ();
+    }
+
+  return tid;
+}
+```
+
+然后测试priority-preempt和priority-change，发现都成功了。
+
+![image-20231203131417885](图片/image-20231203131417885.png)
+
+然后我们再来试一试，
+
+![image-20231203131525128](图片/image-20231203131525128.png)
+
+可以看到可以看到，成功进入了acuire1了，优先级的捐赠也没有问题，但还是存在错误。main释放锁之后，还是没有轮到acuire1和acuire2来执行，我估计这是因为在释放锁后，修改了优先级，但是没有把执行交给高优先级的进程。所以是否在release后加上一句thread_yield()就行了。
+
+![image-20231203134721026](图片/image-20231203134721026.png)
+
+可以正常结束，但是还有问题，看这张截图就能看出端倪了，acquire1先拿到了锁先释放，由于yield之后不会执行输出done那一语句，再由2拿到锁再释放，2输出done，然后1输出done。所以还是main释放锁之后优先级的调度上出了问题。
+
+![image-20231203135554583](图片/image-20231203135554583.png)
+
+可是我已经把前面写过的能影响优先级的程序都检查了一遍，都没有问题。然后我又试着在acquire1内输出前后的线程，发现一个是main(31)在acquire1(32)后面，还有一个前面的是乱码。又试了试两个next的，也就是main后面的，也乱码。那么acquire2又到哪里去了呢？
+
+acquire2得不到锁，不在ready队列里，显然是被移出去了，也就是阻塞了，但是在哪里把它阻塞了呢？想到这，我又看了一眼sema_up和sema_down，终于找到了问题的所在。在sema_down的函数里，有一个list_push_back将等待的线程放到信号量的等待队列并将其阻塞。然后在sema_up中解除阻塞。因为是1先申请的锁，所以采用list_push_back的方法，最后出来的会是acquire1而不是优先级高的acquire2，在1释放锁之前，2一直等在这里。所以很简单，list_push_back改成list_insert_ordered就行了。
+
+```c
+void
+sema_down (struct semaphore *sema) 
+{
+  enum intr_level old_level;
+
+  ASSERT (sema != NULL);
+  ASSERT (!intr_context ());
+
+  old_level = intr_disable ();
+  while (sema->value == 0) 
+    {
+      list_insert_ordered (&sema->waiters, &thread_current ()->elem,thread_cmp_priority_v2,NULL);
+      thread_block ();
+    }
+  sema->value--;
+  intr_set_level (old_level);
+}
+```
+
+这里thread_cmp_priority_v2，采用的是利用list_entry这个函数的方法，适用性要比我之前写的那个更好。之前那个我把定位的全局变量放到thread.c这个文件里了，导致别的文件识别不了，放到.c文件里又会报错，所以采用了这个。
+
+![image-20231203145721807](图片/image-20231203145721807.png)
+
+可以看到，2先申请锁释放后交给了1。然后把我在priority-donate-one.c文件里面写的测试语句删掉，再make后run一下
+
+![image-20231203150027840](图片/image-20231203150027840.png)
+
+可以看到符合预期，然后再make tests/threads/priority-donate-one.result
+
+![image-20231203150145079](图片/image-20231203150145079.png)
+
+OK，成功PASS。然后再试一试其他几个
+
+![image-20231203150239559](图片/image-20231203150239559.png)
+
+###### multiple通过
+
+###### **multiple2卡住了**
+
+![image-20231203150427627](图片/image-20231203150427627.png)
+
+###### nest通过
+
+###### sema不行
+
+![image-20231203151456149](图片/image-20231203151456149.png)
+
+###### lower过了
+
+![image-20231203151542001](图片/image-20231203151542001.png)
+
+###### fifo通过
+
+![image-20231203151702117](图片/image-20231203151702117.png)
+
+###### chain卡住
+
+所以接下来，还需要针对性解决这三个按理：
+
+我们先来看multiple2
+
+##### ⑤逐个攻破
+
+```c
+void
+test_priority_donate_multiple2 (void)
+{
+  struct lock a, b;
+
+  /* This test does not work with the MLFQS. */
+  ASSERT (!thread_mlfqs);
+
+  /* Make sure our priority is the default. */
+  ASSERT (thread_get_priority () == PRI_DEFAULT);
+
+  lock_init (&a);
+  lock_init (&b);
+
+  lock_acquire (&a);
+  lock_acquire (&b);
+
+  thread_create ("a", PRI_DEFAULT + 3, a_thread_func, &a);
+  msg ("Main thread should have priority %d.  Actual priority: %d.",
+       PRI_DEFAULT + 3, thread_get_priority ());
+
+  thread_create ("c", PRI_DEFAULT + 1, c_thread_func, NULL);
+
+  thread_create ("b", PRI_DEFAULT + 5, b_thread_func, &b);
+  msg ("Main thread should have priority %d.  Actual priority: %d.",
+       PRI_DEFAULT + 5, thread_get_priority ());
+
+  lock_release (&a);
+  msg ("Main thread should have priority %d.  Actual priority: %d.",
+       PRI_DEFAULT + 5, thread_get_priority ());
+
+  lock_release (&b);
+  msg ("Threads b, a, c should have just finished, in that order.");
+  msg ("Main thread should have priority %d.  Actual priority: %d.",
+       PRI_DEFAULT, thread_get_priority ());
+}
+
+static void
+a_thread_func (void *lock_)
+{
+  struct lock *lock = lock_;
+
+  lock_acquire (lock);
+  msg ("Thread a acquired lock a.");
+  lock_release (lock);
+  msg ("Thread a finished.");
+}
+
+static void
+b_thread_func (void *lock_)
+{
+  struct lock *lock = lock_;
+
+  lock_acquire (lock);
+  msg ("Thread b acquired lock b.");
+  lock_release (lock);
+  msg ("Thread b finished.");
+}
+
+static void
+c_thread_func (void *a_ UNUSED)
+{
+  msg ("Thread c finished.");
+}
+```
+
+然后这是我的运行结果
+
+![image-20231203152717959](图片/image-20231203152717959.png)
+
+可以看到，申请了锁a，b后，然后创建线程a并成功进行了优先级捐赠，然后有两种可能，线程c创建或为创建。个人倾向与c成功创建，但是优先级32比34要低，创建了但是没有执行。然后又有一个线程b(36)来申请锁b，然后就出错了。估计是这样，我选择在b申请锁前打印一条语句看一下推断是否正确。
+
+![image-20231203153527221](图片/image-20231203153527221.png)
+
+推断没问题，说明就是进程b申请了锁b，然后出问题了 。但是为什么会出错呢？
+
+我又在我的thread_donate_priority函数中几个节点打印了输出，发现问题出现在`     list_insert_ordered(&ready_list,&lock->holder->elem,thread_cmp_priority,priority_elem_ofs);`这句代码上，然后我就发现了一个低级的错误，我的priority_elem_ofs前面没有加取地址符&。所以要么就加上就完事了，要么就用我前面写的v2
+
+![image-20231203155802089](图片/image-20231203155802089.png)
+
+可以看到，没报错，然后把我写在priority_donate_multiple2中的都打印语句都注释掉。然后再测试一遍
+
+![image-20231203160122277](图片/image-20231203160122277.png)
+
+可以看到成功pass了。连带着chain也过了
+
+![image-20231203160230131](图片/image-20231203160230131.png)
+
+但是sema还是卡住了，我们再继续看sema的测试代码
+
+```c
+void
+test_priority_donate_sema (void)
+{
+  struct lock_and_sema ls;
+
+  /* This test does not work with the MLFQS. */
+  ASSERT (!thread_mlfqs);
+
+  /* Make sure our priority is the default. */
+  ASSERT (thread_get_priority () == PRI_DEFAULT);
+
+  lock_init (&ls.lock);
+  sema_init (&ls.sema, 0);
+  thread_create ("low", PRI_DEFAULT + 1, l_thread_func, &ls);
+  thread_create ("med", PRI_DEFAULT + 3, m_thread_func, &ls);
+  thread_create ("high", PRI_DEFAULT + 5, h_thread_func, &ls);
+  sema_up (&ls.sema);
+  msg ("Main thread finished.");
+}
+
+static void
+l_thread_func (void *ls_)
+{
+  struct lock_and_sema *ls = ls_;
+
+  lock_acquire (&ls->lock);
+  msg ("Thread L acquired lock.");
+  sema_down (&ls->sema);
+  msg ("Thread L downed semaphore.");
+  lock_release (&ls->lock);
+  msg ("Thread L finished.");
+}
+
+static void
+m_thread_func (void *ls_)
+{
+  struct lock_and_sema *ls = ls_;
+
+  sema_down (&ls->sema);
+  msg ("Thread M finished.");
+}
+
+static void
+h_thread_func (void *ls_)
+{
+  struct lock_and_sema *ls = ls_;
+
+  lock_acquire (&ls->lock);
+  msg ("Thread H acquired lock.");
+
+  sema_up (&ls->sema);
+  lock_release (&ls->lock);
+  msg ("Thread H finished.");
+}
+```
+
+![image-20231203161355412](图片/image-20231203161355412.png)
+
+先盘一下运行的逻辑，main先创建一个lock&sema，sema初始值为0。然后依次次创建3个进程L、M、H。但是L创建时，会占有锁，等待一个信号量，M和H都需要等L释放这个锁，所以最终L还是会先执行，然后在sema_down那一句进入阻塞，回来执行main，创建M，然后M也会因为sema_down进入阻塞，再回到main，创建H。H又因为锁阻塞，再回到main，等main释放这个信号量后，L就会执行，然后释放锁后调度，交给H执行，sema_up并结束后调度给M执行，M结束后再给L最后再回到main结束。
+
+但是，实际情况根本不需要分析，因为这里又犯了一个和之前差不多的错误，因为这是在synch.c文件夹里，priority_elem_ofs用不了，所以得用v2，但是我用的是最初的那个。修改后结果如下，大致上差不多，但是有一点小问题。不好描述，看图一清二楚。就是有个输出错位了。
+
+![image-20231203163317980](图片/image-20231203163317980.png)
+
+应该sema_up后就直接转给L来调度的，但是好像没有，先是发生了输出，但是只发生了一半，就给L来执行了。所以直接加上一个thread_yield好像就行了。
+
+试了一下，会发生报错。
+
+![image-20231203164604081](图片/image-20231203164604081.png)
+
+然后，我又在网上参考了一篇博客的方法，它并不是直接调用yield而是套了一层判断，并用函数来封装了。
+
+```c
+void thread_check_priority(){
+  struct thread *t = thread_current();
+  struct list_elem* top = list_begin(&ready_list);
+  struct thread* ready = list_entry(top,struct thread,elem);
+  if(t!=NULL && t->priority < ready ->priority){
+    thread_yield();
+  }
+}
+```
+
+我用了一下，发现还真没问题。
+
+![image-20231203165124089](图片/image-20231203165124089.png)
+
+这我就很好奇了，为什么在前面加了一层判断就行了呢？首先，我觉得t != NULL是没有用的，所以我又试着把t != NULL去了，通过了。所以关键都在`t->priority < ready ->priority`上。如果当前线程的优先级比ready队列中最大的小，就调度。很合理，因为sema_up会放线程解除阻塞，如果比当前线程优先级小，就不转让CPU了，如果大就转让CPU。但直接thread_yield，大的转让给大的，小的再转回给自己不就行了吗？还是不理解。
+
+#### 4.实验结果
+
+##### ①代码：
+
+thread结构体
+
+```c
+struct thread
+  {
+    /* Owned by thread.c. */
+    tid_t tid;                          /* Thread identifier. */
+    enum thread_status status;          /* Thread state. */
+    char name[16];                      /* Name (for debugging purposes). */
+    uint8_t *stack;                     /* Saved stack pointer. */
+    int priority;                       /* Priority. */
+    int original_priority;
+    struct list_elem allelem;           /* List element for all threads list. */
+    struct list holding_locks;
+    struct lock* waiting_lock;
+    /* Shared between thread.c and synch.c. */
+    struct list_elem elem;              /* List element. */
+    int64_t ticks_blocked;              /* Remain sleep ticks*/
+#ifdef USERPROG
+    /* Owned by userprog/process.c. */
+    uint32_t *pagedir;                  /* Page directory. */
+#endif
+
+    /* Owned by thread.c. */
+    unsigned magic;                     /* Detects stack overflow. */
+  };
+```
+
+lock结构体：
+
+```c
+struct lock 
+  {
+    struct thread *holder;      /* Thread holding lock (for debugging). */
+    struct semaphore semaphore; /* Binary semaphore controlling access. */
+    int max_priority;
+    struct list_elem elem;
+  };
+```
+
+thread_set_priority函数
+
+```c
+void
+thread_set_priority (int new_priority) 
+{
+  if(thread_mlfqs)
+    return;
+  enum intr_level old_level = intr_disable ();
+  struct thread *current_thread = thread_current ();
+  int old_priority = current_thread->priority;
+  current_thread->original_priority = new_priority;
+
+  if (list_empty (&current_thread->holding_locks) || new_priority > old_priority)
+  {
+    current_thread->priority = new_priority;
+    thread_yield ();
+  }
+   intr_set_level (old_level);
+}
+```
+
+thread_create函数
+
+```c
+tid_t
+thread_create (const char *name, int priority,
+               thread_func *function, void *aux) 
+{
+  struct thread *t;
+  struct kernel_thread_frame *kf;
+  struct switch_entry_frame *ef;
+  struct switch_threads_frame *sf;
+  tid_t tid;
+
+  ASSERT (function != NULL);
+
+  /* Allocate thread. */
+  t = palloc_get_page (PAL_ZERO);
+  if (t == NULL)
+    return TID_ERROR;
+
+  /* Initialize thread. */
+  init_thread (t, name, priority);
+  tid = t->tid = allocate_tid ();
+
+  /* Stack frame for kernel_thread(). */
+  kf = alloc_frame (t, sizeof *kf);
+  kf->eip = NULL;
+  kf->function = function;
+  kf->aux = aux;
+
+  /* Stack frame for switch_entry(). */
+  ef = alloc_frame (t, sizeof *ef);
+  ef->eip = (void (*) (void)) kernel_thread;
+
+  /* Stack frame for switch_threads(). */
+  sf = alloc_frame (t, sizeof *sf);
+  sf->eip = switch_entry;
+  sf->ebp = 0;
+
+  t->ticks_blocked = 0;
+  /* Add to run queue. */
+  thread_unblock (t);
+  if (thread_current ()->priority < priority)
+   {
+     thread_yield ();
+    }
+
+  return tid;
+}
+```
+
+init_thread函数
+
+```c
+static void
+init_thread (struct thread *t, const char *name, int priority)
+{
+  enum intr_level old_level;
+
+  ASSERT (t != NULL);
+  ASSERT (PRI_MIN <= priority && priority <= PRI_MAX);
+  ASSERT (name != NULL);
+
+  memset (t, 0, sizeof *t);
+  t->status = THREAD_BLOCKED;
+  strlcpy (t->name, name, sizeof t->name);
+  t->stack = (uint8_t *) t + PGSIZE;
+  t->priority = priority;
+  t->magic = THREAD_MAGIC;
+  list_init(&t->holding_locks);
+  t->original_priority = priority;
+  t->waiting_lock = NULL;
+
+  old_level = intr_disable ();
+  list_insert_ordered (&all_list, &t->allelem, (list_less_func *) &thread_cmp_priority, &priority_allelem_ofs);
+  intr_set_level (old_level);
+}
+```
+
+lock_init函数
+
+```c
+void
+lock_init (struct lock *lock)
+{
+  ASSERT (lock != NULL);
+
+  lock->holder = NULL;
+  sema_init (&lock->semaphore, 1);
+}
+```
+
+lock_acquire函数
+
+```c
+void
+lock_acquire (struct lock *lock)
+{
+  enum intr_level old_level;
+  
+  ASSERT (lock != NULL);
+  ASSERT (!intr_context ());
+  ASSERT (!lock_held_by_current_thread (lock));
+  old_level = intr_disable();
+
+
+  if(lock->holder != NULL && !thread_mlfqs){
+    thread_current()->waiting_lock = lock;
+    thread_donate_priority(lock,thread_current()->priority);
+  }
+
+
+  intr_set_level(old_level);
+  
+  sema_down (&lock->semaphore);
+  old_level = intr_disable();
+  if(!thread_mlfqs){
+    thread_current()->waiting_lock = NULL;
+    lock->max_priority = thread_current()->priority;
+    thread_hold_lock(lock);
+  }
+  lock->holder = thread_current();
+  intr_set_level(old_level);
+}
+
+```
+
+lock_donate_priority函数
+
+```c
+void thread_donate_priority(struct lock* lock,int new_priority){
+  if(lock == NULL){
+    return;
+  }
+  if(new_priority > lock->max_priority){
+    lock->max_priority = new_priority;
+    list_remove(&lock->elem);
+    list_insert_ordered(&lock->holder->holding_locks,&lock->elem,lock_cmp_priority,NULL);
+    lock->holder->priority = list_entry(list_front(&lock->holder->holding_locks),struct lock,elem)->max_priority;
+    //printf("%s max priority is %d\n",&lock->holder->name,lock->holder->priority);
+    if(lock->holder->status == THREAD_READY){
+      list_remove(&lock->holder->elem);
+      list_insert_ordered(&ready_list,&lock->holder->elem,thread_cmp_priority_v2,NULL);
+    }
+    thread_donate_priority(lock->holder->waiting_lock,new_priority);
+  }
+}
+
+```
+
+thread_hold_lock函数
+
+```c
+void thread_hold_lock(struct lock* lock){
+  enum intr_level old_level = intr_disable ();
+  list_insert_ordered(&thread_current()->holding_locks,&lock->elem,lock_cmp_priority,NULL);
+  if (lock->max_priority > thread_current ()->priority)
+  {
+    thread_current ()->priority = lock->max_priority;
+    thread_yield ();
+  }
+
+  intr_set_level (old_level);
+}
+```
+
+lock_cmp_priority函数
+
+```c
+bool lock_cmp_priority(const struct list_elem *a, const struct list_elem *b, void *aux UNUSED){
+  return list_entry (a, struct lock, elem)->max_priority > list_entry (b, struct lock, elem)->max_priority;
+}
+```
+
+lock_release函数
+
+```c
+void
+lock_release (struct lock *lock) 
+{
+  ASSERT (lock != NULL);
+  ASSERT (lock_held_by_current_thread (lock));
+
+  lock->holder = NULL;
+  sema_up (&lock->semaphore);
+  if (!thread_mlfqs)
+    thread_remove_lock(lock);
+}
+```
+
+thread_remove_lock
+
+```c
+void thread_remove_lock (struct lock *lock)
+{
+  enum intr_level old_level = intr_disable ();
+  list_remove (&lock->elem);
+  thread_update_priority (thread_current ());
+  intr_set_level (old_level);
+
+}
+```
+
+thread_update_priority函数
+
+```c
+void thread_update_priority (struct thread *t)
+{
+  enum intr_level old_level = intr_disable ();
+  int max_priority = t->original_priority;
+  int lock_priority;
+
+  if (!list_empty (&t->holding_locks))
+  {
+    list_sort (&t->holding_locks, lock_cmp_priority, NULL);
+    lock_priority = list_entry (list_front (&t->holding_locks), struct lock, elem)->max_priority;
+    if (lock_priority > max_priority)
+      max_priority = lock_priority;
+  }
+  
+  t->priority = max_priority;
+  thread_yield();
+  intr_set_level (old_level);
+}
+```
+
+sema_down函数
+
+```c
+void
+sema_down (struct semaphore *sema) 
+{
+  enum intr_level old_level;
+
+  ASSERT (sema != NULL);
+  ASSERT (!intr_context ());
+
+  old_level = intr_disable ();
+  while (sema->value == 0) 
+    {
+      list_insert_ordered (&sema->waiters, &thread_current ()->elem,thread_cmp_priority_v2,NULL);
+      thread_block ();
+    }
+  sema->value--;
+  intr_set_level (old_level);
+}
+```
+
+seme_up函数
+
+```c
+void
+sema_up (struct semaphore *sema) 
+{
+  enum intr_level old_level;
+
+  ASSERT (sema != NULL);
+
+  old_level = intr_disable ();
+  if (!list_empty (&sema->waiters)) 
+  {
+    list_sort (&sema->waiters, thread_cmp_priority_v2, NULL);
+    thread_unblock (list_entry (list_pop_front (&sema->waiters), struct thread, elem));
+  }
+    
+  sema->value++;
+  
+  intr_set_level (old_level);
+
+  thread_check_priority();
+}
+```
+
+##### ②结果
+
+因为多级优先队列的时候总是会出现卡住的情况，所以，我只能一个一个来了，Project 1后面的部分估计就没时间写了，要开始Project 2了，很可惜。
+
+alarm-single
+
+![image-20231211153704351](图片/image-20231211153704351.png)
+
+alarm-multiple
+
+![image-20231211153735235](图片/image-20231211153735235.png)
+
+alarm-simultaneous
+
+![image-20231211153835888](图片/image-20231211153835888.png)
+
+alarm-priority
+
+![image-20231211153922170](图片/image-20231211153922170.png)
+
+alarm-zero
+
+![image-20231211153955652](图片/image-20231211153955652.png)
+
+priority-change
+
+![image-20231211154209583](图片/image-20231211154209583.png)
+
+priority-donate-one
+
+![image-20231211154249103](图片/image-20231211154249103.png)
+
+priority-donate-multiple
+
+![image-20231211154327201](图片/image-20231211154327201.png)
+
+priority-donate-multiple2
+
+![image-20231211154353359](图片/image-20231211154353359.png)
+
+priority-donate-nest
+
+![image-20231211154420947](图片/image-20231211154420947.png)
+
+priority-donate-sema
+
+![image-20231211154456283](图片/image-20231211154456283.png)
+
+priority-donate-lower
+
+![image-20231211154547046](图片/image-20231211154547046.png)
+
+priority-fifo
+
+![image-20231211154622320](图片/image-20231211154622320.png)
+
+priority-preempt
+
+![image-20231211154651494](图片/image-20231211154651494.png)
+
+priority-sema
+
+![image-20231211154726045](图片/image-20231211154726045.png)
+
+priority-donate-chain
+
+![image-20231211154808854](图片/image-20231211154808854.png)
+
+##### ③小结和反思
+
+- 这一次就完成了Project1中优先级发生反转的问题。这次做完实验，对优先级反转和如何解决这个问题（如何进行优先级捐赠）有了更深的印象。这个Project1后面还需要解决多级优先队列调度，但可惜的是时间不够了，这个12月还有好多事情要做。所以就先到这了，接下来要开始Project2的内容了。
+- 这次主要卡住的点是，上次优先级调度有几个地方没做完，比如创建线程和修改优先级的时候忘记调度了。然后就是一些小细节没有注意到，比如说sema_down的那个insert_push_back和没注意到需要加上取址符，导致其实已经做的差不多了，但就是没有结果，又不断地从头开始找原因。
+- 还有一个问题就是我在解决priority-donate-chain那里抛出来地问题。还是没有想到应该怎么理解。
+
+## Project2
